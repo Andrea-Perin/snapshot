@@ -3,14 +3,24 @@
 Snapshot an experiment script and ALL of its local (project-relative) dependencies.
 Only files that actually get imported are copied — nothing else.
 
+The snapshot directory name is the canonical run name:
+    <label>__<YYYYmmdd_HHMMSS>_<token>
+`label` is a human-readable name (defaults to the script's filename stem).
+Pass the same string (or its trimmed form via display_name()) to
+wandb.init(name=...) so the wandb UI and the local filesystem always agree.
+The token (SLURM job id under slurm, else random hex) plus atomic directory
+creation protects against same-second launches of the same script.
+
 Usage:
-    python snapshot_experiment.py my_experiment.py
-    python snapshot_experiment.py my_experiment.py --out snapshots/ --root .
+    python snapshot.py my_experiment.py
+    python snapshot.py my_experiment.py --out snapshots/ --root .
 """
 
 import ast
 import sys
 import json
+import os
+import uuid
 import shutil
 import argparse
 from pathlib import Path
@@ -153,10 +163,55 @@ def collect_dependencies(entry: Path, root: Path) -> set[Path]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Snapshot: copy files, preserve relative structure, write metadata
+# 4. Run naming (shared by the snapshot dir and wandb)
 # ---------------------------------------------------------------------------
 
-def snapshot(entry_script: str, out_base: str = "snapshots", root: str = ".") -> Path:
+def _caller_file() -> Path:
+    """First frame on the call stack that isn't this file."""
+    import inspect
+
+    this_file = Path(__file__).resolve()
+    for frame_info in inspect.stack():
+        candidate = Path(frame_info.filename).resolve()
+        if candidate != this_file:
+            return candidate
+    sys.exit("[snap] Could not determine the calling script.")
+
+
+def make_run_name(label: str | Path | None = None) -> str:
+    """
+    The one name shared by the snapshot directory and the wandb run.
+    Format: <label>__<YYYYmmdd_HHMMSS>_<token>
+
+    `label` is the human-readable run name (e.g. "fast_autorule_rng3").
+    If omitted, it defaults to the calling script's filename stem.
+    Token is the SLURM job id when running under slurm (unique per job,
+    including per array task), else a random hex string — so simultaneous
+    launches of the same script never collide.
+    """
+    if label is None:
+        label = _caller_file().stem
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = os.environ.get("SLURM_JOB_ID")
+    token = f"slurm{job_id}" if job_id else uuid.uuid4().hex[:6]
+    return f"{label}__{ts}_{token}"
+
+
+def display_name(snap_dir: Path) -> str:
+    """Cosmetic name for the wandb UI: <label>__<timestamp>, token stripped."""
+    return snap_dir.name.rsplit("_", 1)[0]
+
+
+# ---------------------------------------------------------------------------
+# 5. Snapshot: copy files, preserve relative structure, write metadata
+# ---------------------------------------------------------------------------
+
+def snapshot(
+    entry_script: str,
+    out_base: str = "snapshots",
+    root: str = ".",
+    label: str | None = None,
+) -> Path:
     entry = Path(entry_script).resolve()
     root_path = Path(root).resolve()
 
@@ -168,11 +223,20 @@ def snapshot(entry_script: str, out_base: str = "snapshots", root: str = ".") ->
     print(f"[snapshot] Tracing dependencies of {entry.name} ...")
     deps = collect_dependencies(entry, root_path)
 
-    # Name the snapshot after the script + timestamp
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    snap_name = f"{entry.stem}__{ts}"
-    snap_dir = Path(out_base).resolve() / snap_name
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    run_name = make_run_name(label if label is not None else entry)
+    out_resolved = Path(out_base).resolve()
+
+    for _ in range(10):
+        snap_dir = out_resolved / run_name
+        try:
+            snap_dir.parent.mkdir(parents=True, exist_ok=True)
+            snap_dir.mkdir(exist_ok=False)  # atomic: fails if the dir already exists
+            break
+        except FileExistsError:
+            # Same-second collision with another job — append a token, retry.
+            run_name = f"{run_name}_{uuid.uuid4().hex[:4]}"
+    else:
+        sys.exit("[snapshot] Could not create a unique snapshot directory")
 
     copied = []
     for dep in sorted(deps):
@@ -187,7 +251,8 @@ def snapshot(entry_script: str, out_base: str = "snapshots", root: str = ".") ->
     meta = {
         "entry": str(entry.relative_to(root_path)),
         "root": str(root_path),
-        "timestamp": ts,
+        "run_name": run_name,
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "python": sys.version,
         "files_captured": sorted(copied),
         "file_count": len(copied),
@@ -201,39 +266,26 @@ def snapshot(entry_script: str, out_base: str = "snapshots", root: str = ".") ->
 
 
 # ---------------------------------------------------------------------------
-# 5. In-script convenience function
+# 6. In-script convenience function
 # ---------------------------------------------------------------------------
 
-def snap(out_base: str = "snapshots", root: str = ".") -> Path:
+def snap(out_base: str = "snapshots", root: str = ".", label: str | None = None) -> Path:
     """
     Call this from inside your experiment script to snapshot itself.
+    Returns the snapshot directory; its `.name` is the canonical run name.
 
     Usage:
-        from snapshot_experiment import snap
-        snap()                            # at the top, or just before the run
-        snap(out_base="my_snaps", root="/path/to/project")
+        from snapshot import snap, display_name
+        out_dir = snap(label="fast_autorule_rng3")   # or just snap()
+        wandb.init(name=display_name(out_dir), ...)
 
     The caller's __file__ is detected automatically via the call stack.
     """
-    import inspect
-
-    # Walk up the call stack to find the first frame that isn't this file.
-    this_file = Path(__file__).resolve()
-    caller_file = None
-    for frame_info in inspect.stack():
-        candidate = Path(frame_info.filename).resolve()
-        if candidate != this_file:
-            caller_file = candidate
-            break
-
-    if caller_file is None:
-        sys.exit("[snap] Could not determine the calling script.")
-
-    return snapshot(str(caller_file), out_base=out_base, root=root)
+    return snapshot(str(_caller_file()), out_base=out_base, root=root, label=label)
 
 
 # ---------------------------------------------------------------------------
-# 6. CLI
+# 7. CLI
 # ---------------------------------------------------------------------------
 
 def main():
